@@ -1,0 +1,37 @@
+# Next.js
+node_modules/
+.next/
+out/
+dist/
+
+# Environment variables
+.env*
+!.env.example
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Uploaded/local files
+backend/uploads/
+uploads/
+
+# Database/local files
+*.db
+*.sqlite
+*.sqlite3
+
+# Build/cache
+*.tsbuildinfo
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+*.log
+
+# macOS
+.DS_Store
