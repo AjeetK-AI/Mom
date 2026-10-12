@@ -1,6 +1,7 @@
 from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
+from app.models.post import PostStatus, PostType
 
 from app.models.post import PostStatus
 from app.schemas.category import CategoryResponse
@@ -16,6 +17,7 @@ class PostFields(BaseModel):
     category_id: int | None = Field(default=None, gt=0)
     featured_image_url: HttpUrl | None = Field(default=None, max_length=2048)
     status: PostStatus = PostStatus.DRAFT
+    post_type: PostType = PostType.LATEST
 
 
 class PostCreate(PostFields):
@@ -31,6 +33,7 @@ class PostUpdate(BaseModel):
     featured_image_url: HttpUrl | None = Field(default=None, max_length=2048)
     status: PostStatus | None = None
     published_at: datetime | None = None
+    post_type: PostType | None = None
 
     @model_validator(mode="after")
     def reject_null_required_fields(self) -> "PostUpdate":
@@ -53,7 +56,8 @@ class PostResponse(BaseModel):
     published_at: datetime | None
     created_at: datetime
     updated_at: datetime
-
+    post_type: PostType
+ 
     model_config = ConfigDict(from_attributes=True)
 
 

@@ -1,4 +1,7 @@
+
 import type { ArticleCategory } from "@/lib/article-categories";
+
+export type PostType = "featured" | "latest" | "archive";
 
 export type Article = {
   id: string;
@@ -7,4 +10,5 @@ export type Article = {
   text: string;
   image: string | null;
   date: string;
+  postType: PostType;
 };

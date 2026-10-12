@@ -1,12 +1,12 @@
+
 import hmac
 import logging
-
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import ValidationError
-
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -15,7 +15,7 @@ from app.categories import CATEGORY_NAMES
 from app.config import Settings, get_settings
 from app.database import get_db
 from app.models.category import Category
-from app.models.post import Post, PostStatus
+from app.models.post import Post, PostStatus, PostType
 from app.models.telegram_update import TelegramUpdate
 from app.schemas.telegram import (
     TelegramDocument,
@@ -41,58 +41,47 @@ router = APIRouter(
 
 WELCOME_MESSAGE = (
     "Welcome! 👋\n\n"
-    "To publish a new article:\n\n"
-    "1️⃣ Send a photo with a short caption.\n"
-    "   The caption will become the article title.\n\n"
-    "2️⃣ I will ask you for the article text.\n"
-    "   Send the article text as a separate message.\n\n"
-    "3️⃣ I will ask you to choose a category.\n"
-    "   Reply with the category name or number.\n\n"
-    "That's it — your article will be published to the website. ✅"
+    "What would you like to publish today?"
 )
 
 HELP_MESSAGE = (
-    f"{WELCOME_MESSAGE}\n\n"
+    "Welcome! 👋\n\n"
+    "Choose a post type to publish a new article.\n\n"
     "Available commands:\n"
+    "/start — create a new post\n"
     "/latest — show recent articles\n"
     "/edit — edit an article\n"
-    "/delete — delete an article\n"
+    "/delete — delete an article"
 )
 
 EMPTY_MESSAGE = (
-    "Please send some article text, or send a photo with a caption."
+    "Please send the text for your article."
 )
 
 PHOTO_CAPTION_REQUIRED = (
-    "Please send the photo again with an article caption."
+    "Please send the photo again with a short caption. "
+    "The caption will become the Featured post title."
 )
 
 SAVE_FAILED_MESSAGE = (
     "Sorry, I couldn't save your article. Please try again."
 )
 
-NO_PENDING_MESSAGE = (
-    "I don't have an article waiting for a category. "
-    "Please send an article or photo with a caption first."
-)
-
-CATEGORY_INVALID_MESSAGE = (
-    "I couldn't match that category. "
-    "Please reply with a category name or number.\n\n"
-)
-
 IMAGE_SAVE_FAILED_MESSAGE = (
     "Sorry, I couldn't save your photo. Please try again."
 )
 
+NO_PENDING_MESSAGE = (
+    "I couldn't find an article waiting for a category. "
+    "Please choose a post type using /start."
+)
+
 CATEGORY_MESSAGE = (
-    "Which category should this article belong to?\n\n"
-    + "\n".join(
-        f"{number}. {name}"
-        for number, name in enumerate(CATEGORY_NAMES, start=1)
-    )
-    + "\n\n"
-    "Reply with the category name or its number."
+    "Which category should this article belong to?"
+)
+
+CATEGORY_INVALID_MESSAGE = (
+    "Please select one of the category buttons below."
 )
 
 LATEST_EMPTY_MESSAGE = (
@@ -102,9 +91,8 @@ LATEST_EMPTY_MESSAGE = (
 DELETE_USAGE_MESSAGE = (
     "To delete an article:\n\n"
     "/delete POST_ID\n\n"
-    "Example:\n"
-    "/delete 19\n\n"
-    "I will ask you to confirm before deleting it."
+    "Example: /delete 19\n\n"
+    "I will ask you to confirm before archiving it."
 )
 
 EDIT_USAGE_MESSAGE = (
@@ -118,6 +106,10 @@ EDIT_USAGE_MESSAGE = (
     "/edit 19 text My new article text"
 )
 
+FEATURED_PLACEHOLDER = "New Featured Article"
+LATEST_PLACEHOLDER = "New Latest Article"
+ARCHIVE_PLACEHOLDER = "New Image with Text Post"
+
 
 # =========================================================
 # Telegram service
@@ -127,6 +119,58 @@ def get_telegram_service(
     settings: Settings = Depends(get_settings),
 ) -> TelegramService:
     return TelegramService(settings)
+
+
+# =========================================================
+# Keyboards
+# =========================================================
+
+def _post_type_keyboard() -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": "⭐ Featured",
+                    "callback_data": "post_type:featured",
+                }
+            ],
+            [
+                {
+                    "text": "📝 Latest — Text Only",
+                    "callback_data": "post_type:latest",
+                }
+            ],
+            [
+                {
+                    "text": "🖼️ Image with Text",
+                    "callback_data": "post_type:archive",
+                }
+            ],
+        ]
+    }
+
+
+def _category_keyboard(
+    db: Session,
+) -> dict[str, Any]:
+    categories = db.scalars(
+        select(Category).order_by(Category.name)
+    ).all()
+
+    buttons = [
+        {
+            "text": category.name,
+            "callback_data": f"category:{category.id}",
+        }
+        for category in categories
+    ]
+
+    rows = [
+        buttons[index:index + 2]
+        for index in range(0, len(buttons), 2)
+    ]
+
+    return {"inline_keyboard": rows}
 
 
 # =========================================================
@@ -141,10 +185,7 @@ async def telegram_webhook(
     telegram: TelegramService = Depends(get_telegram_service),
 ) -> dict[str, bool]:
 
-    # -----------------------------------------------------
-    # Verify Telegram webhook secret
-    # -----------------------------------------------------
-
+    # Verify webhook secret.
     provided_secret = request.headers.get(
         "X-Telegram-Bot-Api-Secret-Token",
         "",
@@ -171,31 +212,131 @@ async def telegram_webhook(
             detail="Telegram webhook is not configured",
         )
 
-    # -----------------------------------------------------
-    # Validate Telegram payload
-    # -----------------------------------------------------
-
+    # Validate update.
     try:
         raw_payload = await request.json()
-
-        payload = TelegramUpdatePayload.model_validate(
-            raw_payload
-        )
-
+        payload = TelegramUpdatePayload.model_validate(raw_payload)
     except (ValueError, ValidationError) as exc:
         raise HTTPException(
             status_code=422,
             detail="Invalid Telegram update",
         ) from exc
 
+    # -----------------------------------------------------
+    # Inline-button callback
+    # -----------------------------------------------------
+
+    callback = payload.callback_query
+
+    if callback is not None:
+        sender_id = callback.from_user.id
+
+        if sender_id != settings.telegram_allowed_user_id:
+            raise HTTPException(
+                status_code=403,
+                detail="Unauthorized Telegram user",
+            )
+
+        callback_message = callback.message
+        chat_id = (
+            callback_message.chat.id
+            if callback_message is not None
+            and callback_message.chat is not None
+            else sender_id
+        )
+
+        # Stop the Telegram button's loading indicator.
+        try:
+            await telegram.answer_callback_query(callback.id)
+        except TelegramAPIError:
+            logger.warning(
+                "Could not acknowledge callback for update %s",
+                payload.update_id,
+            )
+
+        # Do not process the same button click twice.
+        if _update_exists(db, payload.update_id):
+            return {"ok": True}
+
+        data = callback.data or ""
+
+        if data.startswith("post_type:"):
+            value = data.partition(":")[2]
+
+            post_types = {
+                "featured": PostType.FEATURED,
+                "latest": PostType.LATEST,
+                "archive": PostType.ARCHIVE,
+            }
+
+            selected_type = post_types.get(value)
+
+            if selected_type is None:
+                return await _record_and_reply(
+                    db,
+                    payload.update_id,
+                    telegram,
+                    chat_id,
+                    "Please use /start and choose a valid post type.",
+                )
+
+            return await _handle_post_type_selection(
+                db=db,
+                update_id=payload.update_id,
+                telegram=telegram,
+                chat_id=chat_id,
+                post_type=selected_type,
+            )
+
+        if data.startswith("category:"):
+            category_id = data.partition(":")[2]
+
+            if not category_id.isdigit():
+                return await _record_and_reply(
+                    db,
+                    payload.update_id,
+                    telegram,
+                    chat_id,
+                    CATEGORY_INVALID_MESSAGE,
+                    reply_markup=_category_keyboard(db),
+                )
+
+            category = db.get(Category, int(category_id))
+
+            if category is None:
+                return await _record_and_reply(
+                    db,
+                    payload.update_id,
+                    telegram,
+                    chat_id,
+                    "That category is no longer available. Please choose again.",
+                    reply_markup=_category_keyboard(db),
+                )
+
+            return await _handle_category(
+                db=db,
+                update_id=payload.update_id,
+                telegram=telegram,
+                chat_id=chat_id,
+                category=category,
+            )
+
+        return await _record_and_reply(
+            db,
+            payload.update_id,
+            telegram,
+            chat_id,
+            "I didn't recognize that button. Please use /start.",
+        )
+
+    # -----------------------------------------------------
+    # Ordinary message
+    # -----------------------------------------------------
+
     message = payload.message
 
     if message is None:
         return {"ok": True}
-
-    # -----------------------------------------------------
-    # Check authorized Telegram user
-    # -----------------------------------------------------
 
     sender_id = (
         message.from_user.id
@@ -209,9 +350,18 @@ async def telegram_webhook(
             detail="Unauthorized Telegram user",
         )
 
-    # -----------------------------------------------------
-    # Logging
-    # -----------------------------------------------------
+    chat_id = _chat_id(message, sender_id)
+
+    if chat_id is None:
+        return {"ok": True}
+
+    if _update_exists(db, payload.update_id):
+        return await _retry_confirmation(
+            db,
+            payload.update_id,
+            telegram,
+            chat_id,
+        )
 
     raw_message = (
         raw_payload.get("message")
@@ -243,31 +393,7 @@ async def telegram_webhook(
         message.caption is not None,
     )
 
-    # -----------------------------------------------------
-    # Get chat
-    # -----------------------------------------------------
-
-    chat_id = _chat_id(message, sender_id)
-
-    if chat_id is None:
-        return {"ok": True}
-
-    # -----------------------------------------------------
-    # Idempotency
-    # -----------------------------------------------------
-
-    if _update_exists(db, payload.update_id):
-        return await _retry_confirmation(
-            db,
-            payload.update_id,
-            telegram,
-            chat_id,
-        )
-
-    # =====================================================
-    # Commands
-    # =====================================================
-
+    # Commands take priority over draft handling.
     command = _command(message.text)
 
     if command == "/start":
@@ -277,6 +403,7 @@ async def telegram_webhook(
             telegram,
             chat_id,
             WELCOME_MESSAGE,
+            reply_markup=_post_type_keyboard(),
         )
 
     if command == "/help":
@@ -286,6 +413,7 @@ async def telegram_webhook(
             telegram,
             chat_id,
             HELP_MESSAGE,
+            reply_markup=_post_type_keyboard(),
         )
 
     if command == "/latest":
@@ -321,194 +449,117 @@ async def telegram_webhook(
             telegram,
             chat_id,
             HELP_MESSAGE,
+            reply_markup=_post_type_keyboard(),
         )
 
-    # =====================================================
-    # Continue an existing article
-    # =====================================================
-
+    # Find the current draft, if any.
     pending_post = _get_pending_post(db)
 
-    if pending_post is not None and not pending_post.content.strip():
+    if pending_post is None:
+        return await _record_and_reply(
+            db,
+            payload.update_id,
+            telegram,
+            chat_id,
+            "Let's create a post first. Tap /start to choose a post type.",
+            reply_markup=_post_type_keyboard(),
+        )
 
+    # The draft already has text, so it is waiting for a category.
+    if pending_post.content.strip():
+        category = _find_category(db, message.text)
+
+        if category is not None:
+            return await _handle_category(
+                db=db,
+                update_id=payload.update_id,
+                telegram=telegram,
+                chat_id=chat_id,
+                category=category,
+            )
+
+        return await _record_and_reply(
+            db,
+            payload.update_id,
+            telegram,
+            chat_id,
+            CATEGORY_INVALID_MESSAGE + "\nChoose a category:",
+            reply_markup=_category_keyboard(db),
+        )
+
+    # -----------------------------------------------------
+    # Latest: text-only post
+    # -----------------------------------------------------
+
+    if pending_post.post_type == PostType.LATEST:
         if message.text is None or not message.text.strip():
             return await _record_and_reply(
                 db,
                 payload.update_id,
                 telegram,
                 chat_id,
-                EMPTY_MESSAGE,
+                "For a Latest post, please send text only. No image is needed.",
             )
 
-        pending_post.content = message.text.strip()
+        article_text = message.text.strip()
+        pending_post.title = _title_from_text(article_text)
+        pending_post.content = article_text
 
-        try:
-            db.commit()
-
-        except SQLAlchemyError:
-            db.rollback()
-
-            await _send_save_failure(
-                telegram,
-                chat_id,
-                payload.update_id,
-            )
-
-            raise HTTPException(
-                status_code=503,
-                detail="The article body could not be saved",
-            ) from None
-
-        try:
-            await telegram.send_message(
-                chat_id,
-                CATEGORY_MESSAGE,
-            )
-
-        except TelegramAPIError:
-            logger.warning(
-                "Could not send category request after saving "
-                "article body for update %s",
-                payload.update_id,
-            )
-
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    "Article body was saved, but Telegram "
-                    "response could not be sent"
-                ),
-            ) from None
-
-        return {"ok": True}
-
-    # =====================================================
-    # Check whether this message is a category
-    # =====================================================
-
-    category = _find_category(
-        db,
-        message.text,
-    )
-
-    if category is not None:
-        return await _handle_category(
+        return await _save_post_step(
             db=db,
             update_id=payload.update_id,
+            post=pending_post,
             telegram=telegram,
             chat_id=chat_id,
-            category=category,
+            reply=CATEGORY_MESSAGE,
+            reply_markup=_category_keyboard(db),
         )
 
-    # =====================================================
-    # New article/photo submission
-    # =====================================================
+    # -----------------------------------------------------
+    # Featured and Image with Text: image first
+    # -----------------------------------------------------
 
-    content, file_id = _article_content(message)
+    file_id = _message_image_file_id(message)
 
-    if content is None:
-        reply = (
-            PHOTO_CAPTION_REQUIRED
-            if (
-                message.photo
-                or _is_image_document(message.document)
+    if pending_post.featured_image_url is None:
+        if file_id is None:
+            expected = (
+                "For Featured, send a photo with a short caption/title."
+                if pending_post.post_type == PostType.FEATURED
+                else "For Image with Text, send a photo first. A caption is optional."
             )
-            else EMPTY_MESSAGE
+
+            return await _record_and_reply(
+                db,
+                payload.update_id,
+                telegram,
+                chat_id,
+                expected,
+            )
+
+        caption = (
+            message.caption.strip()
+            if message.caption and message.caption.strip()
+            else None
         )
 
-        return await _record_and_reply(
-            db,
-            payload.update_id,
-            telegram,
-            chat_id,
-            reply,
-        )
-
-    # -----------------------------------------------------
-    # Continue existing article draft
-    # -----------------------------------------------------
-
-    pending_post = _get_pending_post(db)
-
-    if pending_post is not None:
-
-        if not pending_post.content.strip():
-
-            pending_post.content = content.strip()
-
-            try:
-                db.commit()
-
-            except SQLAlchemyError:
-                db.rollback()
-
-                await _send_save_failure(
-                    telegram,
-                    chat_id,
-                    payload.update_id,
-                )
-
-                raise HTTPException(
-                    status_code=503,
-                    detail="The article body could not be saved",
-                ) from None
-
-            try:
-                await telegram.send_message(
-                    chat_id,
-                    CATEGORY_MESSAGE,
-                )
-
-            except TelegramAPIError:
-                logger.warning(
-                    "Could not send category request after saving "
-                    "article body for update %s",
-                    payload.update_id,
-                )
-
-                raise HTTPException(
-                    status_code=503,
-                    detail=(
-                        "Article body was saved, but Telegram "
-                        "response could not be sent"
-                    ),
-                ) from None
-
-            return {"ok": True}
-
-        reply = (
-            CATEGORY_INVALID_MESSAGE
-            + CATEGORY_MESSAGE
-        )
-
-        return await _record_and_reply(
-            db,
-            payload.update_id,
-            telegram,
-            chat_id,
-            reply,
-        )
-
-    # =====================================================
-    # Save image locally
-    # =====================================================
-
-    featured_image_url = None
-    saved_image_path: Path | None = None
-
-    if file_id is not None:
+        if (
+            pending_post.post_type == PostType.FEATURED
+            and caption is None
+        ):
+            return await _record_and_reply(
+                db,
+                payload.update_id,
+                telegram,
+                chat_id,
+                PHOTO_CAPTION_REQUIRED,
+            )
 
         try:
             file_info = await telegram.get_file(file_id)
+            telegram_file_path = file_info.get("file_path")
 
-            telegram_file_path = file_info.get(
-                "file_path"
-            )
-
-            if not isinstance(
-                telegram_file_path,
-                str,
-            ):
+            if not isinstance(telegram_file_path, str):
                 raise TelegramAPIError(
                     "Telegram returned an invalid file response"
                 )
@@ -517,40 +568,14 @@ async def telegram_webhook(
                 telegram_file_path
             )
 
-            (
-                featured_image_url,
-                saved_image_path,
-            ) = save_telegram_image(
+            image_url, saved_image_path = save_telegram_image(
                 image_content,
                 telegram_file_path,
             )
 
-        except TelegramAPIError:
-
-            logger.warning(
-                "Could not retrieve photo for Telegram "
-                "update %s",
-                payload.update_id,
-            )
-
-            await _send_image_save_failure(
-                telegram,
-                chat_id,
-                payload.update_id,
-            )
-
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    "The photo could not be retrieved "
-                    "from Telegram"
-                ),
-            ) from None
-
-        except OSError:
-
+        except (TelegramAPIError, OSError):
             logger.exception(
-                "Could not store photo for Telegram update %s",
+                "Could not save Telegram image for update %s",
                 payload.update_id,
             )
 
@@ -565,156 +590,229 @@ async def telegram_webhook(
                 detail="The photo could not be saved",
             ) from None
 
-    # =====================================================
-    # Record Telegram update
-    # =====================================================
+        pending_post.featured_image_url = image_url
+        pending_post.telegram_file_id = file_id
 
-    try:
+        if caption:
+            pending_post.title = caption[:255]
+        elif pending_post.post_type == PostType.ARCHIVE:
+            pending_post.title = ARCHIVE_PLACEHOLDER
 
-        telegram_update = TelegramUpdate(
-            update_id=payload.update_id,
-        )
+        try:
+            _record_update(db, payload.update_id, pending_post.id)
+            db.commit()
 
-        db.add(telegram_update)
-        db.flush()
+        except SQLAlchemyError:
+            db.rollback()
 
-    except IntegrityError:
+            if saved_image_path is not None:
+                saved_image_path.unlink(missing_ok=True)
 
-        db.rollback()
-
-        if saved_image_path is not None:
-            saved_image_path.unlink(
-                missing_ok=True
-            )
-
-        if _update_exists(
-            db,
-            payload.update_id,
-        ):
-            return await _retry_confirmation(
-                db,
-                payload.update_id,
+            await _send_save_failure(
                 telegram,
                 chat_id,
+                payload.update_id,
             )
 
-        logger.error(
-            "Database constraint failed while recording "
-            "Telegram update %s",
-            payload.update_id,
+            raise HTTPException(
+                status_code=503,
+                detail="The photo could not be saved to the draft",
+            ) from None
+
+        prompt = (
+            "Great! 👍\n\nNow send me the article text."
         )
 
-        await _send_save_failure(
-            telegram,
-            chat_id,
-            payload.update_id,
-        )
-
-        raise HTTPException(
-            status_code=503,
-            detail="The update could not be processed",
-        ) from None
-
-    except SQLAlchemyError as exc:
-
-        db.rollback()
-
-        if saved_image_path is not None:
-            saved_image_path.unlink(
-                missing_ok=True
+        try:
+            await telegram.send_message(chat_id, prompt)
+        except TelegramAPIError:
+            logger.warning(
+                "Image saved but prompt failed for update %s",
+                payload.update_id,
             )
 
-        logger.exception(
-            "Database failed while recording Telegram "
-            "update %s: %s",
-            payload.update_id,
-            exc,
-        )
+        return {"ok": True}
 
-        await _send_save_failure(
+    # Image is already attached; now expect the article body.
+    if message.text is None or not message.text.strip():
+        return await _record_and_reply(
+            db,
+            payload.update_id,
             telegram,
             chat_id,
-            payload.update_id,
+            EMPTY_MESSAGE,
         )
 
-        raise HTTPException(
-            status_code=503,
-            detail="The update could not be processed",
-        ) from None
+    article_text = message.text.strip()
+    pending_post.content = article_text
 
-    # =====================================================
-    # Create temporary draft
-    # =====================================================
+    # Image with Text may not have had a caption.
+    if (
+        pending_post.post_type == PostType.ARCHIVE
+        and pending_post.title == ARCHIVE_PLACEHOLDER
+    ):
+        pending_post.title = _title_from_text(article_text)
+
+    return await _save_post_step(
+        db=db,
+        update_id=payload.update_id,
+        post=pending_post,
+        telegram=telegram,
+        chat_id=chat_id,
+        reply=CATEGORY_MESSAGE,
+        reply_markup=_category_keyboard(db),
+    )
+
+
+# =========================================================
+# Post type selection
+# =========================================================
+
+async def _handle_post_type_selection(
+    *,
+    db: Session,
+    update_id: int,
+    telegram: TelegramService,
+    chat_id: int,
+    post_type: PostType,
+) -> dict[str, bool]:
+
+    existing = _get_pending_post(db)
+
+    if existing is not None:
+        return await _record_and_reply(
+            db,
+            update_id,
+            telegram,
+            chat_id,
+            (
+                "You already have a draft in progress. "
+                "Please finish it before starting another post."
+            ),
+        )
+
+    placeholders = {
+        PostType.FEATURED: FEATURED_PLACEHOLDER,
+        PostType.LATEST: LATEST_PLACEHOLDER,
+        PostType.ARCHIVE: ARCHIVE_PLACEHOLDER,
+    }
 
     try:
-
         post = create_draft(
             db,
-            title=content.strip()[:255],
+            title=placeholders[post_type],
             content="",
-            slug_seed=f"new-article-{payload.update_id}",
-            telegram_file_id=file_id,
-            featured_image_url=featured_image_url,
+            slug_seed=f"telegram-{post_type.value}-{update_id}",
+            post_type=post_type,
         )
 
-        telegram_update.post_id = post.id
-
+        _record_update(db, update_id, post.id)
         db.commit()
 
     except SQLAlchemyError:
-
         db.rollback()
-
-        if saved_image_path is not None:
-            saved_image_path.unlink(
-                missing_ok=True
-            )
-
         logger.exception(
-            "Database failed while saving draft for "
-            "Telegram update %s",
-            payload.update_id,
+            "Could not create Telegram draft for update %s",
+            update_id,
         )
 
-        await _send_save_failure(
-            telegram,
-            chat_id,
-            payload.update_id,
-        )
+        await _send_save_failure(telegram, chat_id, update_id)
 
         raise HTTPException(
             status_code=503,
-            detail="The update could not be processed",
+            detail="The draft could not be created",
         ) from None
 
-    # =====================================================
-    # Ask Mom for article text
-    # =====================================================
+    prompts = {
+        PostType.FEATURED: (
+            "⭐ Featured selected!\n\n"
+            "Send a photo with a short caption. "
+            "The caption becomes the post title. "
+            "Then send the article text."
+        ),
+        PostType.LATEST: (
+            "📝 Latest selected!\n\n"
+            "Send the complete text in one message. "
+            "The first line will be used as the title."
+        ),
+        PostType.ARCHIVE: (
+            "🖼️ Image with Text selected!\n\n"
+            "Send the photo first. A caption is optional. "
+            "Then send the article text."
+        ),
+    }
 
     try:
-
-        await telegram.send_message(
-            chat_id,
-            "Great! 👍\n\nNow send me the article text.",
-        )
-
+        await telegram.send_message(chat_id, prompts[post_type])
     except TelegramAPIError:
-
         logger.warning(
-            "Could not send article text request "
-            "for update %s",
-            payload.update_id,
+            "Draft created but prompt could not be sent for update %s",
+            update_id,
         )
+
+    return {"ok": True}
+
+
+# =========================================================
+# Save a draft step and ask for the next step
+# =========================================================
+
+async def _save_post_step(
+    *,
+    db: Session,
+    update_id: int,
+    post: Post,
+    telegram: TelegramService,
+    chat_id: int,
+    reply: str,
+    reply_markup: dict[str, Any] | None = None,
+) -> dict[str, bool]:
+
+    try:
+        _record_update(db, update_id, post.id)
+        db.commit()
+
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception(
+            "Could not save draft step for update %s",
+            update_id,
+        )
+
+        await _send_save_failure(telegram, chat_id, update_id)
 
         raise HTTPException(
             status_code=503,
-            detail=(
-                "Article was saved, but Telegram "
-                "response could not be sent"
-            ),
+            detail="The article could not be saved",
         ) from None
 
+    try:
+        await telegram.send_message(
+            chat_id,
+            reply,
+            reply_markup=reply_markup,
+        )
+    except TelegramAPIError:
+        logger.warning(
+            "Draft saved but next-step prompt failed for update %s",
+            update_id,
+        )
+
     return {"ok": True}
+
+
+def _record_update(
+    db: Session,
+    update_id: int,
+    post_id: int | None = None,
+) -> None:
+    db.add(
+        TelegramUpdate(
+            update_id=update_id,
+            post_id=post_id,
+        )
+    )
+    db.flush()
 
 
 # =========================================================
@@ -731,59 +829,34 @@ async def _handle_latest(
 
     posts = db.scalars(
         select(Post)
-        .where(
-            Post.status == PostStatus.PUBLISHED
-        )
-        .order_by(
-            Post.published_at.desc(),
-            Post.id.desc(),
-        )
+        .where(Post.status == PostStatus.PUBLISHED)
+        .order_by(Post.published_at.desc(), Post.id.desc())
         .limit(10)
     ).all()
 
     if not posts:
         return await _record_and_reply(
-            db,
-            update_id,
-            telegram,
-            chat_id,
-            LATEST_EMPTY_MESSAGE,
+            db, update_id, telegram, chat_id, LATEST_EMPTY_MESSAGE
         )
 
-    lines = [
-        "Recent published articles:\n"
-    ]
+    lines = ["Recent published articles:\n"]
 
     for post in posts:
-
         category = (
-            db.get(
-                Category,
-                post.category_id,
-            )
+            db.get(Category, post.category_id)
             if post.category_id is not None
             else None
         )
-
         category_name = (
-            category.name
-            if category is not None
-            else "Uncategorized"
+            category.name if category is not None else "Uncategorized"
         )
-
         lines.append(
             f"#{post.id} — {post.title}\n"
             f"Category: {category_name}\n"
         )
 
-    reply = "\n".join(lines)
-
     return await _record_and_reply(
-        db,
-        update_id,
-        telegram,
-        chat_id,
-        reply,
+        db, update_id, telegram, chat_id, "\n".join(lines)
     )
 
 
@@ -800,160 +873,80 @@ async def _handle_delete_command(
     text: str,
 ) -> dict[str, bool]:
 
-    parts = text.strip().split(
-        maxsplit=2
-    )
+    parts = text.strip().split(maxsplit=2)
 
-    if (
-        len(parts) < 2
-        or not parts[1].isdigit()
-    ):
+    if len(parts) < 2 or not parts[1].isdigit():
         return await _record_and_reply(
-            db,
-            update_id,
-            telegram,
-            chat_id,
-            DELETE_USAGE_MESSAGE,
+            db, update_id, telegram, chat_id, DELETE_USAGE_MESSAGE
         )
 
     post_id = int(parts[1])
+    post = db.get(Post, post_id)
 
-    post = db.get(
-        Post,
-        post_id,
-    )
-
-    if (
-        post is None
-        or post.status != PostStatus.PUBLISHED
-    ):
+    if post is None or post.status != PostStatus.PUBLISHED:
         return await _record_and_reply(
             db,
             update_id,
             telegram,
             chat_id,
-            (
-                f"I couldn't find published "
-                f"article #{post_id}."
-            ),
+            f"I couldn't find published article #{post_id}.",
         )
-
-    # -----------------------------------------------------
-    # First command: ask for confirmation
-    # -----------------------------------------------------
 
     if len(parts) == 2:
-
-        reply = (
-            "⚠️ Please confirm deletion.\n\n"
-            f"#{post.id} — {post.title}\n\n"
-            "This will remove the article from the "
-            "website.\n\n"
-            f"To confirm, send:\n"
-            f"/delete {post.id} confirm"
-        )
-
-        return await _record_and_reply(
-            db,
-            update_id,
-            telegram,
-            chat_id,
-            reply,
-        )
-
-    # -----------------------------------------------------
-    # Confirmation
-    # -----------------------------------------------------
-
-    if parts[2].casefold() != "confirm":
-
         return await _record_and_reply(
             db,
             update_id,
             telegram,
             chat_id,
             (
-                "Deletion was not confirmed.\n\n"
-                f"To confirm, send:\n"
-                f"/delete {post.id} confirm"
+                "⚠️ Please confirm archiving this article.\n\n"
+                f"#{post.id} — {post.title}\n\n"
+                f"To confirm, send:\n/delete {post.id} confirm"
             ),
         )
 
-    # -----------------------------------------------------
-    # Delete local image after archiving article
-    # -----------------------------------------------------
+    if parts[2].casefold() != "confirm":
+        return await _record_and_reply(
+            db,
+            update_id,
+            telegram,
+            chat_id,
+            f"Deletion was not confirmed.\n\n/delete {post.id} confirm",
+        )
 
     image_path: Path | None = None
 
     if post.featured_image_url:
-
-        image_name = Path(
-            post.featured_image_url
-        ).name
-
         image_path = (
             Path(__file__).resolve().parents[2]
             / "uploads"
-            / image_name
+            / Path(post.featured_image_url).name
         )
 
     try:
-
-        # We archive instead of physically deleting
-        # the database row. This protects TelegramUpdate
-        # foreign-key relationships and keeps history safe.
-
         post.status = PostStatus.ARCHIVED
-
         db.commit()
-
     except SQLAlchemyError:
-
         db.rollback()
-
-        logger.exception(
-            "Failed to delete/archive post %s",
-            post_id,
-        )
-
-        await _send_save_failure(
-            telegram,
-            chat_id,
-            update_id,
-        )
-
+        logger.exception("Failed to archive post %s", post_id)
+        await _send_save_failure(telegram, chat_id, update_id)
         raise HTTPException(
             status_code=503,
-            detail="The article could not be deleted",
+            detail="The article could not be archived",
         ) from None
 
-    # Remove local image if one exists.
     if image_path is not None:
-
         try:
-            image_path.unlink(
-                missing_ok=True
-            )
-
+            image_path.unlink(missing_ok=True)
         except OSError:
-
-            logger.warning(
-                "Could not remove image for archived "
-                "post %s: %s",
-                post_id,
-                image_path,
-            )
+            logger.warning("Could not remove image for post %s", post_id)
 
     return await _record_and_reply(
         db,
         update_id,
         telegram,
         chat_id,
-        (
-            "Deleted successfully. 🗑️\n\n"
-            f"Article #{post.id} is no longer visible "
-            "on the website."
-        ),
+        f"Archived successfully. 🗑️\nArticle #{post.id} is no longer visible on the website.",
     )
 
 
@@ -970,171 +963,88 @@ async def _handle_edit_command(
     text: str,
 ) -> dict[str, bool]:
 
-    parts = text.strip().split(
-        maxsplit=3
-    )
+    parts = text.strip().split(maxsplit=3)
 
     if len(parts) < 4 or not parts[1].isdigit():
-
         return await _record_and_reply(
-            db,
-            update_id,
-            telegram,
-            chat_id,
-            EDIT_USAGE_MESSAGE,
+            db, update_id, telegram, chat_id, EDIT_USAGE_MESSAGE
         )
 
     post_id = int(parts[1])
     field = parts[2].casefold()
     value = parts[3].strip()
+    post = db.get(Post, post_id)
 
-    post = db.get(
-        Post,
-        post_id,
-    )
-
-    if (
-        post is None
-        or post.status != PostStatus.PUBLISHED
-    ):
+    if post is None or post.status != PostStatus.PUBLISHED:
         return await _record_and_reply(
             db,
             update_id,
             telegram,
             chat_id,
-            (
-                f"I couldn't find published "
-                f"article #{post_id}."
-            ),
+            f"I couldn't find published article #{post_id}.",
         )
 
     if not value:
-
         return await _record_and_reply(
-            db,
-            update_id,
-            telegram,
-            chat_id,
-            EDIT_USAGE_MESSAGE,
+            db, update_id, telegram, chat_id, EDIT_USAGE_MESSAGE
         )
 
-    # -----------------------------------------------------
-    # Edit category
-    # -----------------------------------------------------
+    category: Category | None = None
 
     if field == "category":
-
-        category = _find_category(
-            db,
-            value,
-        )
+        category = _find_category(db, value)
 
         if category is None:
-
             return await _record_and_reply(
                 db,
                 update_id,
                 telegram,
                 chat_id,
-                (
-                    CATEGORY_INVALID_MESSAGE
-                    + CATEGORY_MESSAGE
-                ),
+                CATEGORY_INVALID_MESSAGE,
+                reply_markup=_category_keyboard(db),
             )
 
         post.category_id = category.id
 
-    # -----------------------------------------------------
-    # Edit title
-    # -----------------------------------------------------
-
     elif field == "title":
-
         post.title = value[:255]
 
-    # -----------------------------------------------------
-    # Edit article text
-    # -----------------------------------------------------
-
     elif field == "text":
-
         post.content = value
 
     else:
-
         return await _record_and_reply(
-            db,
-            update_id,
-            telegram,
-            chat_id,
-            EDIT_USAGE_MESSAGE,
+            db, update_id, telegram, chat_id, EDIT_USAGE_MESSAGE
         )
-
-    # -----------------------------------------------------
-    # Save edit
-    # -----------------------------------------------------
 
     try:
-
         db.commit()
-
     except SQLAlchemyError:
-
         db.rollback()
-
-        logger.exception(
-            "Failed to edit post %s",
-            post_id,
-        )
-
-        await _send_save_failure(
-            telegram,
-            chat_id,
-            update_id,
-        )
-
+        logger.exception("Failed to edit post %s", post_id)
+        await _send_save_failure(telegram, chat_id, update_id)
         raise HTTPException(
             status_code=503,
             detail="The article could not be edited",
         ) from None
 
-    # -----------------------------------------------------
-    # Confirmation
-    # -----------------------------------------------------
-
-    if field == "category":
-
+    if field == "category" and category is not None:
         confirmation = (
             "Updated successfully! ✅\n\n"
-            f"Article: {post.title}\n"
-            f"Category: {category.name}"
+            f"Article: {post.title}\nCategory: {category.name}"
         )
-
     elif field == "title":
-
-        confirmation = (
-            "Updated successfully! ✅\n\n"
-            f"New title: {post.title}"
-        )
-
+        confirmation = f"Updated successfully! ✅\n\nNew title: {post.title}"
     else:
-
-        confirmation = (
-            "Updated successfully! ✅\n\n"
-            f"Article #{post.id} text has been updated."
-        )
+        confirmation = f"Updated successfully! ✅\n\nArticle #{post.id} text has been updated."
 
     return await _record_and_reply(
-        db,
-        update_id,
-        telegram,
-        chat_id,
-        confirmation,
+        db, update_id, telegram, chat_id, confirmation
     )
 
 
 # =========================================================
-# Category handling
+# Category handling and publishing
 # =========================================================
 
 async def _handle_category(
@@ -1146,164 +1056,44 @@ async def _handle_category(
     category: Category,
 ) -> dict[str, bool]:
 
-    # -----------------------------------------------------
-    # Record category-response Telegram update first
-    # -----------------------------------------------------
-
-    try:
-
-        telegram_update = TelegramUpdate(
-            update_id=update_id,
-        )
-
-        db.add(telegram_update)
-        db.flush()
-
-    except IntegrityError:
-
-        db.rollback()
-
-        if _update_exists(
-            db,
-            update_id,
-        ):
-            return await _retry_confirmation(
-                db,
-                update_id,
-                telegram,
-                chat_id,
-            )
-
-        raise HTTPException(
-            status_code=503,
-            detail="The update could not be processed",
-        ) from None
-
-    except SQLAlchemyError:
-
-        db.rollback()
-
-        await _send_save_failure(
-            telegram,
-            chat_id,
-            update_id,
-        )
-
-        raise HTTPException(
-            status_code=503,
-            detail="The update could not be processed",
-        ) from None
-
-    # -----------------------------------------------------
-    # Find article waiting for category
-    # -----------------------------------------------------
-
     post = _get_pending_post(db)
 
-    if post is None:
-
-        try:
-            db.commit()
-
-        except SQLAlchemyError:
-
-            db.rollback()
-
-            await _send_save_failure(
-                telegram,
-                chat_id,
-                update_id,
-            )
-
-            raise HTTPException(
-                status_code=503,
-                detail="The update could not be processed",
-            ) from None
-
-        try:
-
-            await telegram.send_message(
-                chat_id,
-                NO_PENDING_MESSAGE,
-            )
-
-        except TelegramAPIError:
-
-            logger.warning(
-                "Could not send no-pending response "
-                "for update %s",
-                update_id,
-            )
-
-        return {"ok": True}
-
-    # -----------------------------------------------------
-    # Publish immediately
-    # -----------------------------------------------------
-
-    try:
-
-        post.category_id = category.id
-
-        post.status = PostStatus.PUBLISHED
-
-        post.published_at = (
-            datetime.now(UTC)
-            .replace(tzinfo=None)
+    if post is None or not post.content.strip():
+        return await _record_and_reply(
+            db,
+            update_id,
+            telegram,
+            chat_id,
+            NO_PENDING_MESSAGE,
+            reply_markup=_post_type_keyboard(),
         )
 
-        telegram_update.post_id = post.id
+    try:
+        post.category_id = category.id
+        post.status = PostStatus.PUBLISHED
+        post.published_at = datetime.now(UTC).replace(tzinfo=None)
 
+        _record_update(db, update_id, post.id)
         db.commit()
 
     except SQLAlchemyError:
-
         db.rollback()
-
-        logger.exception(
-            "Database failed while publishing post %s",
-            post.id,
-        )
-
-        await _send_save_failure(
-            telegram,
-            chat_id,
-            update_id,
-        )
-
+        logger.exception("Failed to publish post %s", post.id)
+        await _send_save_failure(telegram, chat_id, update_id)
         raise HTTPException(
             status_code=503,
             detail="The article could not be published",
         ) from None
 
-    # -----------------------------------------------------
-    # Confirmation
-    # -----------------------------------------------------
-
     try:
-
         await _send_published_confirmation(
-            telegram,
-            chat_id,
-            post,
-            category,
+            telegram, chat_id, post, category
         )
-
     except TelegramAPIError:
-
         logger.warning(
-            "Could not send published confirmation "
-            "for update %s",
-            update_id,
+            "Post %s published, but confirmation failed",
+            post.id,
         )
-
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Article was published, but Telegram "
-                "confirmation could not be sent"
-            ),
-        ) from None
 
     return {"ok": True}
 
@@ -1318,66 +1108,41 @@ async def _record_and_reply(
     telegram: TelegramService,
     chat_id: int,
     reply: str,
+    reply_markup: dict[str, Any] | None = None,
 ) -> dict[str, bool]:
 
     try:
-
-        db.add(
-            TelegramUpdate(
-                update_id=update_id,
-            )
-        )
-
+        _record_update(db, update_id)
         db.commit()
 
     except IntegrityError:
-
         db.rollback()
-
-        if _update_exists(
-            db,
-            update_id,
-        ):
+        if _update_exists(db, update_id):
             return {"ok": True}
 
-        await _send_save_failure(
-            telegram,
-            chat_id,
-            update_id,
-        )
-
+        await _send_save_failure(telegram, chat_id, update_id)
         raise HTTPException(
             status_code=503,
             detail="The update could not be processed",
         ) from None
 
     except SQLAlchemyError:
-
         db.rollback()
-
-        await _send_save_failure(
-            telegram,
-            chat_id,
-            update_id,
-        )
-
+        await _send_save_failure(telegram, chat_id, update_id)
         raise HTTPException(
             status_code=503,
             detail="The update could not be processed",
         ) from None
 
     try:
-
         await telegram.send_message(
             chat_id,
             reply,
+            reply_markup=reply_markup,
         )
-
     except TelegramAPIError:
-
         logger.warning(
-            "Could not send Telegram response "
-            "for update %s",
+            "Could not send Telegram response for update %s",
             update_id,
         )
 
@@ -1385,7 +1150,7 @@ async def _record_and_reply(
 
 
 # =========================================================
-# Error messages
+# Error handling
 # =========================================================
 
 async def _send_save_failure(
@@ -1393,21 +1158,10 @@ async def _send_save_failure(
     chat_id: int,
     update_id: int,
 ) -> None:
-
     try:
-
-        await telegram.send_message(
-            chat_id,
-            SAVE_FAILED_MESSAGE,
-        )
-
+        await telegram.send_message(chat_id, SAVE_FAILED_MESSAGE)
     except TelegramAPIError:
-
-        logger.warning(
-            "Could not send Telegram error response "
-            "for update %s",
-            update_id,
-        )
+        logger.warning("Could not send save failure for update %s", update_id)
 
 
 async def _send_image_save_failure(
@@ -1415,32 +1169,17 @@ async def _send_image_save_failure(
     chat_id: int,
     update_id: int,
 ) -> None:
-
     try:
-
-        await telegram.send_message(
-            chat_id,
-            IMAGE_SAVE_FAILED_MESSAGE,
-        )
-
+        await telegram.send_message(chat_id, IMAGE_SAVE_FAILED_MESSAGE)
     except TelegramAPIError:
-
-        logger.warning(
-            "Could not send Telegram photo error response "
-            "for update %s",
-            update_id,
-        )
+        logger.warning("Could not send image failure for update %s", update_id)
 
 
 # =========================================================
-# Idempotency
+# Idempotency and pending post
 # =========================================================
 
-def _update_exists(
-    db: Session,
-    update_id: int,
-) -> bool:
-
+def _update_exists(db: Session, update_id: int) -> bool:
     return (
         db.scalar(
             select(TelegramUpdate.id).where(
@@ -1457,7 +1196,6 @@ async def _retry_confirmation(
     telegram: TelegramService,
     chat_id: int,
 ) -> dict[str, bool]:
-
     post_id = db.scalar(
         select(TelegramUpdate.post_id).where(
             TelegramUpdate.update_id == update_id
@@ -1467,64 +1205,26 @@ async def _retry_confirmation(
     if post_id is None:
         return {"ok": True}
 
-    post = db.get(
-        Post,
-        post_id,
-    )
+    post = db.get(Post, post_id)
 
     if post is None:
         return {"ok": True}
 
     try:
-
-        if post.status == PostStatus.PUBLISHED:
-
-            category = (
-                db.get(
-                    Category,
-                    post.category_id,
-                )
-                if post.category_id is not None
-                else None
-            )
-
+        if post.status == PostStatus.PUBLISHED and post.category_id is not None:
+            category = db.get(Category, post.category_id)
             if category is not None:
-
                 await _send_published_confirmation(
-                    telegram,
-                    chat_id,
-                    post,
-                    category,
+                    telegram, chat_id, post, category
                 )
-
-        else:
-
-            await telegram.send_message(
-                chat_id,
-                CATEGORY_MESSAGE,
-            )
-
     except TelegramAPIError:
-
         logger.warning(
-            "Could not retry Telegram confirmation "
-            "for update %s",
+            "Could not retry confirmation for update %s",
             update_id,
         )
 
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Telegram confirmation could not be sent"
-            ),
-        ) from None
-
     return {"ok": True}
 
-
-# =========================================================
-# Publish confirmation
-# =========================================================
 
 async def _send_published_confirmation(
     telegram: TelegramService,
@@ -1532,42 +1232,27 @@ async def _send_published_confirmation(
     post: Post,
     category: Category,
 ) -> None:
-
-    confirmation = (
-        "Published successfully! ✅\n\n"
-        f"Title: {post.title}\n"
-        f"Category: {category.name}\n"
-        f"Post ID: {post.id}\n"
-        "Status: published"
-    )
-
     await telegram.send_message(
         chat_id,
-        confirmation,
+        (
+            "Published successfully! ✅\n\n"
+            f"Title: {post.title}\n"
+            f"Category: {category.name}\n"
+            f"Post ID: {post.id}\n"
+            "Status: published"
+        ),
     )
 
 
-# =========================================================
-# Pending article
-# =========================================================
-
-def _get_pending_post(
-    db: Session,
-) -> Post | None:
-
+def _get_pending_post(db: Session) -> Post | None:
     return db.scalar(
         select(Post)
-        .join(
-            TelegramUpdate,
-            TelegramUpdate.post_id == Post.id,
-        )
+        .join(TelegramUpdate, TelegramUpdate.post_id == Post.id)
         .where(
             Post.status == PostStatus.DRAFT,
             TelegramUpdate.post_id.is_not(None),
         )
-        .order_by(
-            TelegramUpdate.id.desc()
-        )
+        .order_by(TelegramUpdate.id.desc())
         .limit(1)
     )
 
@@ -1580,7 +1265,6 @@ def _find_category(
     db: Session,
     text: str | None,
 ) -> Category | None:
-
     if text is None or not text.strip():
         return None
 
@@ -1588,137 +1272,65 @@ def _find_category(
 
     categories = {
         category.name.casefold(): category
-        for category in db.scalars(
-            select(Category)
-        )
+        for category in db.scalars(select(Category))
     }
 
-    # Number selection
     if value.isdigit():
-
         number = int(value)
-
         if 1 <= number <= len(CATEGORY_NAMES):
-
             return categories.get(
                 CATEGORY_NAMES[number - 1].casefold()
             )
-
         return None
 
-    # Name selection
-    return categories.get(
-        value.casefold()
-    )
+    return categories.get(value.casefold())
 
 
 # =========================================================
-# Chat ID
+# Message helpers
 # =========================================================
 
 def _chat_id(
     message: TelegramMessage,
     sender_id: int,
 ) -> int | None:
-
-    chat = message.chat
-
-    if chat is None:
+    if message.chat is None:
         return sender_id
+    return message.chat.id
 
-    return chat.id
 
-
-# =========================================================
-# Command parser
-# =========================================================
-
-def _command(
-    text: str | None,
-) -> str | None:
-
+def _command(text: str | None) -> str | None:
     if not text or not text.startswith("/"):
         return None
 
-    first_word = text.split(
-        maxsplit=1
-    )[0]
+    first_word = text.split(maxsplit=1)[0]
+    command, _, _bot_name = first_word.partition("@")
+    return command
 
-    command, separator, _bot_name = (
-        first_word.partition("@")
+
+def _title_from_text(text: str) -> str:
+    first_line = next(
+        (line.strip() for line in text.splitlines() if line.strip()),
+        text.strip(),
     )
-
-    return (
-        command
-        if separator or command.startswith("/")
-        else None
-    )
+    return first_line[:255] or "Untitled"
 
 
-# =========================================================
-# Article content
-# =========================================================
-
-def _article_content(
+def _message_image_file_id(
     message: TelegramMessage,
-) -> tuple[str | None, str | None]:
+) -> str | None:
+    if message.photo:
+        return message.photo[-1].file_id
 
-    file_id = (
-        message.photo[-1].file_id
-        if message.photo
-        else (
-            message.document.file_id
-            if (
-                _is_image_document(
-                    message.document
-                )
-                and message.document is not None
-            )
-            else None
-        )
-    )
+    if _is_image_document(message.document):
+        return message.document.file_id
 
-    # -----------------------------------------------------
-    # Photo/document with caption
-    # -----------------------------------------------------
+    return None
 
-    if file_id is not None:
-
-        if (
-            message.caption is None
-            or not message.caption.strip()
-        ):
-            return None, None
-
-        return (
-            message.caption,
-            file_id,
-        )
-
-    # -----------------------------------------------------
-    # Text message
-    # -----------------------------------------------------
-
-    if (
-        message.text is None
-        or not message.text.strip()
-    ):
-        return None, None
-
-    return (
-        message.text,
-        None,
-    )
-
-
-# =========================================================
-# Image document detection
-# =========================================================
 
 def _is_image_document(
     document: TelegramDocument | None,
 ) -> bool:
-
     if document is None:
         return False
 
@@ -1734,13 +1346,8 @@ def _is_image_document(
         ".webp",
     }
 
-    mime_type = (
-        document.mime_type or ""
-    ).casefold()
-
-    extension = Path(
-        document.file_name or ""
-    ).suffix.casefold()
+    mime_type = (document.mime_type or "").casefold()
+    extension = Path(document.file_name or "").suffix.casefold()
 
     return (
         mime_type.startswith("image/")

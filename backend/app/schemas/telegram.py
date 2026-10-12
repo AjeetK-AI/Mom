@@ -1,3 +1,4 @@
+
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
 
@@ -38,8 +39,18 @@ class TelegramMessage(BaseModel):
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
 
+class TelegramCallbackQuery(BaseModel):
+    id: str = Field(min_length=1, max_length=256)
+    from_user: TelegramUser = Field(alias="from")
+    message: TelegramMessage | None = None
+    data: str | None = Field(default=None, max_length=64)
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+
 class TelegramUpdate(BaseModel):
     update_id: StrictInt = Field(ge=0)
     message: TelegramMessage | None = None
+    callback_query: TelegramCallbackQuery | None = None
 
     model_config = ConfigDict(extra="ignore")

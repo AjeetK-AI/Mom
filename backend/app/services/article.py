@@ -9,6 +9,8 @@ from sqlalchemy.orm import Session
 from app.models.category import Category
 from app.models.post import Post, PostStatus
 from app.schemas.post import PostCreate, PostUpdate
+from app.models.post import Post, PostStatus, PostType
+
 
 
 def create_article(db: Session, payload: PostCreate) -> Post:
@@ -27,6 +29,7 @@ def create_article(db: Session, payload: PostCreate) -> Post:
     return post
 
 
+
 def create_draft(
     db: Session,
     *,
@@ -35,6 +38,7 @@ def create_draft(
     slug_seed: str,
     telegram_file_id: str | None = None,
     featured_image_url: str | None = None,
+    post_type: PostType = PostType.LATEST,
 ) -> Post:
     slug = generate_unique_slug(db, slug_seed)
     post = Post(
@@ -45,11 +49,13 @@ def create_draft(
         category_id=None,
         featured_image_url=featured_image_url,
         telegram_file_id=telegram_file_id,
+        post_type=post_type,
         status=PostStatus.DRAFT,
     )
     db.add(post)
     db.flush()
     return post
+
 
 
 def update_article(db: Session, post_id: int, payload: PostUpdate) -> Post:

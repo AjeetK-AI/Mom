@@ -1,5 +1,6 @@
 from datetime import datetime
 from enum import Enum
+from app.models.category import Category
 
 from sqlalchemy import DateTime, Enum as SQLAlchemyEnum, ForeignKey, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -11,6 +12,12 @@ class PostStatus(str, Enum):
     DRAFT = "draft"
     PUBLISHED = "published"
     ARCHIVED = "archived"
+
+
+class PostType(str, Enum):
+    FEATURED = "featured"
+    LATEST = "latest"
+    ARCHIVE = "archive"
 
 
 class Post(Base):
@@ -28,6 +35,19 @@ class Post(Base):
     )
     featured_image_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     telegram_file_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    post_type: Mapped[PostType] = mapped_column(
+        SQLAlchemyEnum(
+            PostType,
+            name="post_type",
+            values_callable=lambda enum_type: [member.value for member in enum_type],
+        ),
+        nullable=False,
+        default=PostType.LATEST,
+        server_default=PostType.LATEST.value,
+        index=True,
+    )
+
     status: Mapped[PostStatus] = mapped_column(
         SQLAlchemyEnum(
             PostStatus,

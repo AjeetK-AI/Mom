@@ -35,24 +35,37 @@ export default function HomePage() {
       return matchesCategory && searchable.includes(query);
     });
   }, [activeCategory, articles, search]);
-  const homeArticles = filteredArticles.slice(0, 9);
+  
+  const featuredArticles = filteredArticles
+    .filter((article) => article.postType === "featured")
+    .slice(0, 3);
+
+  const latestArticles = filteredArticles.filter(
+    (article) => article.postType === "latest",
+  );
+
+  const archiveArticles = filteredArticles.filter(
+    (article) => article.postType === "archive",
+  );
+
   const articleRows = [
     {
       title: "Featured",
       description: "A few handpicked notes to bring a little goodness into your day.",
-      articles: homeArticles.slice(0, 3),
+      articles: featuredArticles,
     },
     {
       title: "Latest",
       description: "Fresh thoughts and new favorites from the Notes From Mom journal.",
-      articles: homeArticles.slice(3, 6),
+      articles: latestArticles,
     },
     {
       title: "From the Archive",
       description: "A few timeless notes to revisit whenever you need them.",
-      articles: homeArticles.slice(6, 9),
+      articles: archiveArticles,
     },
   ];
+
 
   function handleNewsletter(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -276,19 +289,51 @@ export default function HomePage() {
                 <path d="m4 4 8 8M12 4l-8 8" />
               </svg>
             </button>
-            {selectedArticle.image && (
-              <img className="modal-image" src={selectedArticle.image} alt="" />
-            )}
-            <div className="modal-copy">
-              <span className="article-category">{selectedArticle.category}</span>
-              <h2 id="modal-title">{selectedArticle.title}</h2>
-              <div className="article-meta">
-                <span className="avatar avatar-mom" aria-hidden="true">M</span>
-                <span>Mom</span>
-                <time dateTime={selectedArticle.date}>{formatArticleDate(selectedArticle.date)}</time>
-              </div>
-              <p className="modal-article-text">{selectedArticle.text}</p>
-            </div>
+            
+{selectedArticle.postType === "featured" && (
+  <>
+    {selectedArticle.image && (
+      <img
+        className="modal-image"
+        src={selectedArticle.image}
+        alt={selectedArticle.title}
+      />
+    )}
+
+    <div className="modal-copy">
+      <span className="article-category">
+        {selectedArticle.category}
+      </span>
+
+      <h2 id="modal-title">{selectedArticle.title}</h2>
+
+      <div className="article-meta">
+        <span className="avatar avatar-mom" aria-hidden="true">M</span>
+        <span>Mom</span>
+        <time dateTime={selectedArticle.date}>
+          {formatArticleDate(selectedArticle.date)}
+        </time>
+      </div>
+
+      <p className="modal-article-text">{selectedArticle.text}</p>
+    </div>
+  </>
+)}
+
+{selectedArticle.postType === "latest" && (
+  <div className="modal-copy">
+    <p className="modal-article-text">{selectedArticle.text}</p>
+  </div>
+)}
+
+{selectedArticle.postType === "archive" && selectedArticle.image && (
+  <img
+    className="modal-image archive-modal-image"
+    src={selectedArticle.image}
+    alt={selectedArticle.title}
+  />
+)}
+
           </article>
         </div>
       )}

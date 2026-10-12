@@ -13,11 +13,13 @@ type BackendPost = {
   category: { name: string } | null;
   featured_image_url: string | null;
   status: "draft" | "published" | "archived";
+  post_type: "featured" | "latest" | "archive";
   published_at: string | null;
 };
 
 type BackendPostList = {
   items: BackendPost[];
+  post_type: "featured" | "latest" | "archive";
 };
 
 type PostRow = RowDataPacket & {
@@ -81,6 +83,7 @@ export async function GET() {
       .filter((post) => post.status === "published")
       .map((post) => ({
         id: String(post.id),
+        postType: post.post_type,
         title: post.title,
         category: post.category?.name ?? "Uncategorized",
         text: post.content,
